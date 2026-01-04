@@ -461,7 +461,8 @@ if __name__ == "__main__":
     t = threading.Thread(target=run_telegram_polling, daemon=True)
     t.start()
 
-    if __name__ == "__main__":
+if __name__ == "__main__":
+    print("Starting raffle bot on Render...")
     uvicorn.run(
         app,
         host="0.0.0.0",
