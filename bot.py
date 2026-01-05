@@ -4,25 +4,26 @@ import json
 import random
 import threading
 import time
+import csv
 from typing import Optional, Dict, Any, Tuple
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 import uvicorn
 
 from sqlalchemy import create_engine, select, Integer, String, Text, Boolean
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column
 
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 
 # ==========================
 # CONFIG (ENV)
 # ==========================
-VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "227395470"))  # club227395470
-VK_POST_ID = int(os.getenv("VK_POST_ID", "385"))          # wall-227395470_385
+VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "227395470"))
+VK_POST_ID = int(os.getenv("VK_POST_ID", "385"))
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip()
 
 VK_CALLBACK_SECRET = os.getenv("VK_CALLBACK_SECRET", "secret7slonikov").strip()
@@ -34,11 +35,20 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHANNEL = os.getenv("TG_CHANNEL", "@sevenslonikov").strip()
 TG_BOT_LINK = os.getenv("TG_BOT_LINK", "https://t.me/sevenelephant_bot").strip().replace("@", "")
 
+# сколько попыток всего (для статистики/ограничения кампании)
 TOTAL_ATTEMPTS = int(os.getenv("TOTAL_ATTEMPTS", "100000"))
+
+# сколько бонусных попыток даём за TG (один раз)
 TG_BONUS_ATTEMPTS = int(os.getenv("TG_BONUS_ATTEMPTS", "3"))
 
-# 1 попытка раз в сутки (24 часа)
+# 1 попытка в сутки (24 часа)
 DAILY_COOLDOWN_SECONDS = int(os.getenv("DAILY_COOLDOWN_SECONDS", "86400"))
+
+# шанс выигрыша (примерно 1 из 20 => 0.05)
+WIN_PROB = float(os.getenv("WIN_PROB", "0.05"))
+
+# файл победителей (CSV)
+WINNERS_FILE = os.getenv("WINNERS_FILE", "winners.csv")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///raffle_7slonikov.sqlite3")
 
@@ -46,12 +56,57 @@ VK_API = "https://api.vk.com/method"
 VK_VER = "5.199"
 VK_ID_RE = re.compile(r"^\d+$")
 
+# режим телеги: "webhook" (Render) или "polling" (локально)
+RUN_MODE = os.getenv("RUN_MODE", "").strip().lower()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
+# ==========================
+# Helpers
+# ==========================
 def tg_channel_link() -> str:
     ch = TG_CHANNEL.strip()
     if ch.startswith("@"):
         ch = ch[1:]
     return f"https://t.me/{ch}"
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def fmt_wait(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"~{h} ч {m} мин"
+
+
+# ==========================
+# Winners file
+# ==========================
+_winners_lock = threading.Lock()
+
+
+def ensure_winners_header():
+    # добавим заголовок, если файла нет
+    if os.path.exists(WINNERS_FILE):
+        return
+    with _winners_lock:
+        if os.path.exists(WINNERS_FILE):
+            return
+        with open(WINNERS_FILE, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp", "vk_user_id", "prize_code", "prize_title", "source", "comment_id", "post_id"])
+
+
+def append_winner(vk_user_id: int, prize_code: str, prize_title: str, source: str, comment_id: int, post_id: int):
+    ensure_winners_header()
+    row = [str(now_ts()), str(vk_user_id), prize_code, prize_title, source, str(comment_id), str(post_id)]
+    with _winners_lock:
+        with open(WINNERS_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(row)
 
 
 # ==========================
@@ -80,11 +135,16 @@ class Participant(Base):
     tg_member_ok: Mapped[bool] = mapped_column(Boolean, default=False)
     tg_bonus_granted: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # сколько бонусных попыток осталось (выдаются после TG)
+    bonus_remaining: Mapped[int] = mapped_column(Integer, default=0)
+
+    # статистика
     attempts_used: Mapped[int] = mapped_column(Integer, default=0)
 
-    # Время последней попытки (epoch seconds)
-    last_attempt_at: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # когда была последняя "дневная" попытка (epoch)
+    last_daily_attempt_at: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # результат (если выиграл — фиксируем и больше не даём)
     result_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     result_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -101,10 +161,11 @@ class RaffleState(Base):
     __tablename__ = "raffle_state"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)  # always 1
-    remaining_attempts: Mapped[int] = mapped_column(Integer)    # из TOTAL_ATTEMPTS
-    remaining_prizes: Mapped[int] = mapped_column(Integer)      # всего 100
+    remaining_attempts: Mapped[int] = mapped_column(Integer)    # TOTAL_ATTEMPTS
+    remaining_prizes: Mapped[int] = mapped_column(Integer)      # total prizes
 
 
+# Призы: 20 + 80 = 100
 PRIZES = [
     ("SCHEME_20", "🎁 Схема на выбор (из 20)", 20),
     ("DISCOUNT_50", "🏷 Скидка 50% на схемы для вышивания", 80),
@@ -116,7 +177,7 @@ def init_db() -> None:
     with SessionLocal() as db:
         st = db.get(RaffleState, 1)
         if st is None:
-            total_prizes = sum(x[2] for x in PRIZES)  # 100
+            total_prizes = sum(x[2] for x in PRIZES)
             db.add(RaffleState(id=1, remaining_attempts=TOTAL_ATTEMPTS, remaining_prizes=total_prizes))
 
         for code, title, count in PRIZES:
@@ -185,7 +246,7 @@ def comment_has_codeword(text: str) -> bool:
 
 
 # ==========================
-# Raffle algorithm (100 prizes / 100000 attempts)
+# Raffle algorithm (fixed win prob)
 # ==========================
 def _pick_any_available_prize(db, rng: random.Random) -> Optional[PrizeInventory]:
     prizes = db.scalars(select(PrizeInventory).where(PrizeInventory.remaining > 0)).all()
@@ -194,13 +255,13 @@ def _pick_any_available_prize(db, rng: random.Random) -> Optional[PrizeInventory
     return rng.choice(prizes)
 
 
-def draw_one_attempt(db, vk_user_id: int, rng: random.Random) -> Tuple[str, str]:
+def draw_one_attempt(db, vk_user_id: int, rng: random.Random, *, source: str, comment_id: int, post_id: int) -> Tuple[str, str]:
     p = db.get(Participant, vk_user_id)
     if p is None:
         return "NONE", "Заявка не найдена."
 
     if p.result_code is not None:
-        return p.result_code, (p.result_text or "")
+        return p.result_code, (p.result_text or "Вы уже получили приз.")
 
     st = db.get(RaffleState, 1)
     if st is None:
@@ -211,13 +272,13 @@ def draw_one_attempt(db, vk_user_id: int, rng: random.Random) -> Tuple[str, str]
     if st.remaining_prizes <= 0:
         return "NONE", "Призы уже закончились."
 
-    # тратим 1 попытку
+    # тратим 1 попытку глобально
     st.remaining_attempts -= 1
     p.attempts_used += 1
-    p.last_attempt_at = int(time.time())
 
-    # вероятность выигрыша “без возврата”: remaining_prizes / attempts_total
-    win_prob = st.remaining_prizes / (st.remaining_attempts + 1)
+    # шанс выигрыша (примерно 1/20 => 0.05)
+    win_prob = max(0.0, min(WIN_PROB, 1.0))
+
     if rng.random() >= win_prob:
         db.commit()
         return "NONE", "Не повезло 😔 В этот раз приз не выпал."
@@ -232,32 +293,78 @@ def draw_one_attempt(db, vk_user_id: int, rng: random.Random) -> Tuple[str, str]
 
     p.result_code = prize.code
     p.result_text = f"🎉 Поздравляем! Вам выпал приз: {prize.title}"
+
     db.commit()
+
+    # сохраняем победителя в файл
+    try:
+        append_winner(vk_user_id, prize.code, prize.title, source, comment_id, post_id)
+    except Exception as e:
+        print("WINNERS FILE ERROR:", repr(e))
+
     return p.result_code, p.result_text
 
 
-def format_remaining_time(seconds: int) -> str:
-    if seconds < 0:
-        seconds = 0
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    return f"~{hours} ч {minutes} мин"
-
-
 # ==========================
-# FastAPI (VK Callback)
+# FastAPI (VK + TG webhook)
 # ==========================
 app = FastAPI()
+
+tg_app: Optional[Application] = None
 
 
 @app.on_event("startup")
 async def on_startup():
+    global tg_app
     init_db()
+    ensure_winners_header()
+
+    if TG_BOT_TOKEN:
+        tg_app = Application.builder().token(TG_BOT_TOKEN).build()
+        tg_app.add_handler(CommandHandler("start", start_cmd))
+
+        # webhook режим для Render
+        use_webhook = (RUN_MODE == "webhook") or bool(RENDER_EXTERNAL_URL)
+        if use_webhook:
+            await tg_app.initialize()
+            await tg_app.start()
+
+            public_base = RENDER_EXTERNAL_URL.rstrip("/")
+            if not public_base:
+                # если нет переменной, пользователь может поставить вручную
+                print("WARN: RENDER_EXTERNAL_URL is empty. Set it in Render env to auto set webhook.")
+            else:
+                webhook_url = f"{public_base}/tg/webhook"
+                try:
+                    bot = Bot(token=TG_BOT_TOKEN)
+                    await bot.set_webhook(webhook_url)
+                    print("Telegram webhook set:", webhook_url)
+                except Exception as e:
+                    print("Telegram set_webhook error:", repr(e))
+        else:
+            print("Telegram: RUN_MODE not webhook and RENDER_EXTERNAL_URL empty => polling can be used locally.")
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/debug/env")
+def debug_env():
+    # чтобы быстро проверить, что Render подхватил переменные (не показывает токены)
+    return JSONResponse({
+        "VK_GROUP_ID": VK_GROUP_ID,
+        "VK_POST_ID": VK_POST_ID,
+        "CODEWORD": CODEWORD,
+        "WIN_PROB": WIN_PROB,
+        "DAILY_COOLDOWN_SECONDS": DAILY_COOLDOWN_SECONDS,
+        "TG_CHANNEL": TG_CHANNEL,
+        "TG_BOT_LINK": TG_BOT_LINK,
+        "RUN_MODE": RUN_MODE,
+        "RENDER_EXTERNAL_URL": bool(RENDER_EXTERNAL_URL),
+        "WINNERS_FILE": WINNERS_FILE,
+    })
 
 
 @app.post("/vk/callback")
@@ -268,7 +375,7 @@ async def vk_callback(req: Request):
     except Exception:
         return PlainTextResponse("ok", status_code=200)
 
-    # confirmation от ВК
+    # VK confirmation
     if payload.get("type") == "confirmation":
         return PlainTextResponse(VK_CONFIRMATION_STRING or "NO_CONFIRMATION_STRING_SET", status_code=200)
 
@@ -276,7 +383,7 @@ async def vk_callback(req: Request):
     if VK_CALLBACK_SECRET and payload.get("secret") != VK_CALLBACK_SECRET:
         return PlainTextResponse("ok", status_code=200)
 
-    # интересуют только новые комментарии
+    # only new comments
     if payload.get("type") != "wall_reply_new":
         return PlainTextResponse("ok", status_code=200)
 
@@ -294,7 +401,7 @@ async def vk_callback(req: Request):
     if not comment_has_codeword(text):
         return PlainTextResponse("ok", status_code=200)
 
-    # обязательна подписка на ВК
+    # VK subscription required
     if not vk_groups_is_member(from_id):
         vk_create_comment(
             post_id=post_id,
@@ -310,17 +417,43 @@ async def vk_callback(req: Request):
             db.add(p)
             db.commit()
 
-        # антидубликат (на случай повторной доставки)
+        # already won
+        if p.result_code is not None:
+            vk_create_comment(post_id=post_id, reply_to_comment=comment_id, message=p.result_text or "Вы уже выиграли.")
+            return PlainTextResponse("ok", status_code=200)
+
+        # anti-duplicate
         if p.comment_id == comment_id and p.post_id == post_id:
             return PlainTextResponse("ok", status_code=200)
 
-        # 1 попытка раз в 24 часа (если бонусные TG не используются)
-        now = int(time.time())
-        if p.last_attempt_at is not None and (now - p.last_attempt_at) < DAILY_COOLDOWN_SECONDS:
-            remaining = DAILY_COOLDOWN_SECONDS - (now - p.last_attempt_at)
+        p.post_id = post_id
+        p.comment_id = comment_id
+        p.comment_text = text
+        p.vk_member_ok = True
+        db.commit()
+
+        # decide which "attempt type" we can use:
+        # - if daily attempt available -> consume daily
+        # - else if bonus_remaining > 0 -> consume one bonus
+        # - else deny (tell wait time + how to get bonus)
+        now = now_ts()
+        daily_available = (p.last_daily_attempt_at is None) or ((now - p.last_daily_attempt_at) >= DAILY_COOLDOWN_SECONDS)
+
+        if daily_available:
+            p.last_daily_attempt_at = now
+            db.commit()
+            rng = random.Random()
+            code, result = draw_one_attempt(db, from_id, rng, source="vk_daily", comment_id=comment_id, post_id=post_id)
+        elif p.bonus_remaining > 0:
+            p.bonus_remaining -= 1
+            db.commit()
+            rng = random.Random()
+            code, result = draw_one_attempt(db, from_id, rng, source="vk_bonus", comment_id=comment_id, post_id=post_id)
+        else:
+            remaining = DAILY_COOLDOWN_SECONDS - (now - (p.last_daily_attempt_at or now))
             msg = (
-                "⏳ Сегодня вы уже использовали попытку.\n\n"
-                f"Следующая попытка будет доступна через {format_remaining_time(remaining)}.\n\n"
+                "⏳ Сегодня дневная попытка уже использована.\n"
+                f"Следующая дневная попытка будет через {fmt_wait(remaining)}.\n\n"
                 f"Хотите +{TG_BONUS_ATTEMPTS} бонусные попытки? ✅\n"
                 f"1) Подпишитесь на Telegram-канал: {tg_channel_link()}\n"
                 f"2) Напишите боту:\n"
@@ -330,17 +463,7 @@ async def vk_callback(req: Request):
             vk_create_comment(post_id=post_id, reply_to_comment=comment_id, message=msg)
             return PlainTextResponse("ok", status_code=200)
 
-        # сохраняем комментарий
-        p.post_id = post_id
-        p.comment_id = comment_id
-        p.comment_text = text
-        p.vk_member_ok = True
-        db.commit()
-
-        rng = random.Random()
-        code, result = draw_one_attempt(db, from_id, rng)
-
-    # ответ в ВК
+    # reply in VK
     if code != "NONE":
         vk_create_comment(post_id=post_id, reply_to_comment=comment_id, message=result)
     else:
@@ -349,12 +472,12 @@ async def vk_callback(req: Request):
             reply_to_comment=comment_id,
             message=(
                 f"{result}\n\n"
-                f"Приходите завтра за новой попыткой! ⏰\n\n"
-                f"Хотите +{TG_BONUS_ATTEMPTS} бонусные попытки? ✅\n"
-                f"Подпишитесь на Telegram-канал: {tg_channel_link()}\n"
-                f"И напишите боту:\n"
-                f"/start {from_id}\n"
-                f"Бот: {TG_BOT_LINK}"
+                f"💡 Можно попробовать ещё раз:\n"
+                f"— следующая дневная попытка завтра\n"
+                f"— или получите +{TG_BONUS_ATTEMPTS} бонусные попытки через Telegram ✅\n"
+                f"{tg_channel_link()}\n"
+                f"Бот: {TG_BOT_LINK}\n"
+                f"Команда: /start {from_id}"
             )
         )
 
@@ -362,7 +485,7 @@ async def vk_callback(req: Request):
 
 
 # ==========================
-# Telegram bot (polling)
+# Telegram logic
 # ==========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None or update.message is None:
@@ -370,13 +493,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args or []
     if not args or not VK_ID_RE.match(args[0]):
-        await update.message.reply_text("Команда: /start <ваш_vk_id>\nПример: /start 123456")
+        await update.message.reply_text(
+            "Команда: /start <ваш_vk_id>\n"
+            "Пример: /start 123456\n\n"
+            "После активации бонуса крутите в ВК: пишите комментарий с кодовым словом."
+        )
         return
 
     vk_id = int(args[0])
     tg_id = update.effective_user.id
 
-    # Проверка подписки на канал
+    # check TG channel membership
     try:
         member = await context.bot.get_chat_member(chat_id=TG_CHANNEL, user_id=tg_id)
         status = getattr(member, "status", None)
@@ -388,11 +515,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as db:
         p = db.get(Participant, vk_id)
         if p is None:
-            await update.message.reply_text("Сначала напишите кодовое слово в комментарии под постом ВК.")
+            await update.message.reply_text(
+                "Я не вижу вашу заявку в ВК.\n"
+                "Сначала напишите кодовое слово в комментарии под постом в ВК."
+            )
             return
 
         if p.result_code is not None:
-            await update.message.reply_text(p.result_text or "Вы уже получили результат.")
+            await update.message.reply_text(p.result_text or "Вы уже получили приз.")
             return
 
         p.tg_user_id = tg_id
@@ -409,26 +539,43 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if p.tg_bonus_granted:
-            await update.message.reply_text("Бонусные попытки уже были выданы ранее ✅")
+            await update.message.reply_text(
+                f"Бонус уже активирован ранее ✅\n"
+                f"Осталось бонусных попыток: {p.bonus_remaining}\n\n"
+                "Используйте попытки в ВК: напишите комментарий с кодовым словом под постом."
+            )
             return
 
+        # grant bonus attempts (but do NOT spin here!)
         p.tg_bonus_granted = True
+        p.bonus_remaining = TG_BONUS_ATTEMPTS
         db.commit()
 
-        rng = random.Random()
+    await update.message.reply_text(
+        "✅ Бонус активирован!\n\n"
+        f"Вам добавлено +{TG_BONUS_ATTEMPTS} бонусных попытки.\n"
+        "Используются по одной — только в ВК.\n\n"
+        "👉 Вернитесь в ВК и пишите комментарий с кодовым словом под постом, чтобы крутить."
+    )
 
-        # даём +3 бонусные попытки сразу
-        results = []
-        for i in range(TG_BONUS_ATTEMPTS):
-            code, res = draw_one_attempt(db, vk_id, rng)
-            results.append(f"Попытка {i + 1}: {res}")
-            if code != "NONE":
-                break
 
-    await update.message.reply_text("✅ Бонус активирован!\n\n" + "\n\n".join(results))
+# Telegram webhook endpoint (for Render)
+@app.post("/tg/webhook")
+async def tg_webhook(req: Request):
+    if not TG_BOT_TOKEN or tg_app is None:
+        return JSONResponse({"ok": False, "error": "telegram not configured"}, status_code=200)
+
+    data = await req.json()
+    update = Update.de_json(data, tg_app.bot)
+    try:
+        await tg_app.process_update(update)
+    except Exception as e:
+        print("tg_webhook process_update error:", repr(e))
+    return JSONResponse({"ok": True}, status_code=200)
 
 
 def run_telegram_polling():
+    # local dev only
     if not TG_BOT_TOKEN:
         print("TG_BOT_TOKEN пустой — Telegram бот не запущен.")
         return
@@ -448,25 +595,24 @@ def run_telegram_polling():
     asyncio.run(_runner())
 
 
+# ==========================
+# Entrypoint
+# ==========================
 if __name__ == "__main__":
-    print("Starting 7slonikov raffle bot...")
-    print("Listening on http://127.0.0.1:8000")
+    print("Starting raffle bot...")
     print("VK_GROUP_ID =", VK_GROUP_ID, "VK_POST_ID =", VK_POST_ID, "CODEWORD =", CODEWORD)
-    print("TOTAL_ATTEMPTS =", TOTAL_ATTEMPTS, "DAILY_COOLDOWN_SECONDS =", DAILY_COOLDOWN_SECONDS)
+    print("WIN_PROB =", WIN_PROB, "DAILY_COOLDOWN_SECONDS =", DAILY_COOLDOWN_SECONDS)
     print("TG_CHANNEL =", TG_CHANNEL, "TG_BOT_LINK =", TG_BOT_LINK)
-    print("VK_CALLBACK_SECRET =", VK_CALLBACK_SECRET)
-    print("VK_CONFIRMATION_STRING =", VK_CONFIRMATION_STRING if VK_CONFIRMATION_STRING else "<EMPTY>")
-    print("TG_BOT_TOKEN =", "<SET>" if TG_BOT_TOKEN else "<EMPTY>")
+    print("RUN_MODE =", RUN_MODE, "RENDER_EXTERNAL_URL set =", bool(RENDER_EXTERNAL_URL))
+    print("WINNERS_FILE =", WINNERS_FILE)
 
-    t = threading.Thread(target=run_telegram_polling, daemon=True)
-    t.start()
+    # В Render используем webhook и НЕ запускаем polling
+    use_webhook = (RUN_MODE == "webhook") or bool(RENDER_EXTERNAL_URL)
+    if not use_webhook:
+        t = threading.Thread(target=run_telegram_polling, daemon=True)
+        t.start()
 
-if __name__ == "__main__":
-    print("Starting raffle bot on Render...")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000"))
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
 
 
