@@ -79,6 +79,16 @@ def fmt_wait(seconds: int) -> str:
     return f"~{h} ч {m} мин"
 
 
+def pretty_ratio(prob: float) -> str:
+    try:
+        prob = float(prob)
+        if prob <= 0:
+            return "∞"
+        return str(int(round(1.0 / prob)))
+    except Exception:
+        return "?"
+
+
 # ==========================
 # DB
 # ==========================
@@ -249,7 +259,7 @@ def comment_has_codeword(text_val: str) -> bool:
 
 
 # ==========================
-# Prize picking
+# Prize picking + winner record
 # ==========================
 def _pick_any_available_prize(db, rng: random.Random) -> Optional[PrizeInventory]:
     prizes = db.scalars(select(PrizeInventory).where(PrizeInventory.remaining > 0)).all()
@@ -318,7 +328,6 @@ def draw_one_attempt(
     p.result_code = prize.code
     p.result_text = f"🎉 Поздравляем! Вам выпал приз: {prize.title}"
 
-    # store to winners table
     _record_winner(db, vk_user_id, prize.code, prize.title, source, post_id, comment_id)
 
     db.commit()
@@ -332,7 +341,7 @@ def is_admin(tg_user_id: int) -> bool:
     return tg_user_id in ADMIN_TG_IDS
 
 
-def build_stats_text() -> str:
+def build_stats_text_plain() -> str:
     with SessionLocal() as db:
         st = db.get(RaffleState, 1)
         if not st:
@@ -344,17 +353,17 @@ def build_stats_text() -> str:
         winners_total = db.scalar(select(text("COUNT(1)")).select_from(text("winners"))) or 0
 
         lines = []
-        lines.append("📊 *7 Слоников — статистика розыгрыша*")
+        lines.append("📊 7 Слоников — статистика розыгрыша")
         lines.append("")
-        lines.append(f"🎯 Осталось попыток: *{st.remaining_attempts}*")
-        lines.append(f"🎁 Осталось призов: *{st.remaining_prizes}*")
-        lines.append(f"🏆 Победителей (в БД): *{winners_total}*")
+        lines.append(f"🎯 Осталось попыток: {st.remaining_attempts}")
+        lines.append(f"🎁 Осталось призов: {st.remaining_prizes}")
+        lines.append(f"🏆 Победителей (в БД): {winners_total}")
         lines.append("")
         lines.append("🎁 Остатки по призам:")
         for pr in prizes_sorted:
-            lines.append(f"• {pr.title} — *{pr.remaining}*")
+            lines.append(f"• {pr.title} — {pr.remaining}")
         lines.append("")
-        lines.append(f"🎲 WIN_PROB = *{WIN_PROB}* (~1 из {int(1/WIN_PROB) if WIN_PROB > 0 else '∞'})")
+        lines.append(f"🎲 WIN_PROB = {WIN_PROB} (примерно 1 из {pretty_ratio(WIN_PROB)})")
         return "\n".join(lines)
 
 
@@ -364,7 +373,7 @@ async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Нет доступа.")
         return
-    await update.message.reply_text(build_stats_text(), parse_mode="Markdown")
+    await update.message.reply_text(build_stats_text_plain())
 
 
 async def admin_winners_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -722,6 +731,7 @@ if __name__ == "__main__":
         t.start()
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
 
 
 
