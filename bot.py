@@ -6,6 +6,7 @@ import threading
 import time
 import io
 import csv
+import asyncio
 from typing import Optional, Dict, Any, Tuple, List
 
 import requests
@@ -21,7 +22,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 
 # ==========================
-# CONFIG (ENV) — 7slonikov defaults
+# CONFIG (ENV)
 # ==========================
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "227395470"))
 VK_POST_ID = int(os.getenv("VK_POST_ID", "727"))
@@ -49,16 +50,20 @@ VK_API = "https://api.vk.com/method"
 VK_VER = "5.199"
 VK_ID_RE = re.compile(r"^\d+$")
 
-# Render webhook settings
+# Webhook settings
 RUN_MODE = os.getenv("RUN_MODE", "").strip().lower()  # webhook / polling
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()  # e.g. https://sevenslonikov-1.onrender.com
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
-# Admin TG IDs (comma/space separated)
+# Admin IDs
 ADMIN_TG_IDS_RAW = os.getenv("ADMIN_TG_IDS", "").strip()
 ADMIN_TG_IDS = {int(x) for x in re.split(r"[,\s]+", ADMIN_TG_IDS_RAW) if x.isdigit()}
-
-# safety: cap for /admin_winners
 ADMIN_WINNERS_MAX = int(os.getenv("ADMIN_WINNERS_MAX", "200"))
+
+# Auto-backup (seconds). Default: 24h
+AUTO_BACKUP_INTERVAL_SECONDS = int(os.getenv("AUTO_BACKUP_INTERVAL_SECONDS", "86400"))
+
+# Optional: force reset prize inventory on startup (dangerous for running raffle)
+RESET_PRIZES = os.getenv("RESET_PRIZES", "0").strip() == "1"
 
 
 def tg_channel_link() -> str:
@@ -87,6 +92,16 @@ def pretty_ratio(prob: float) -> str:
         return str(int(round(1.0 / prob)))
     except Exception:
         return "?"
+
+
+def sanitize_db_url(url: str) -> str:
+    """
+    Hide password in URL: postgresql+psycopg://user:pass@host/db -> postgresql+psycopg://user:***@host/db
+    """
+    if not url:
+        return "<EMPTY>"
+    # replace user:password@
+    return re.sub(r":([^:@/]+)@", r":***@", url)
 
 
 # ==========================
@@ -144,7 +159,7 @@ class Winner(Base):
     __tablename__ = "winners"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[int] = mapped_column(Integer)  # epoch seconds
+    ts: Mapped[int] = mapped_column(Integer)
     vk_user_id: Mapped[int] = mapped_column(Integer)
     prize_code: Mapped[str] = mapped_column(String(64))
     prize_title: Mapped[str] = mapped_column(Text)
@@ -153,10 +168,10 @@ class Winner(Base):
     comment_id: Mapped[int] = mapped_column(Integer)
 
 
-# 100 prizes total: 20 + 80
+# ✅ NEW PRIZES: 10 + 70 = 80
 PRIZES = [
-    ("SCHEME_20", "🎁 Схема на выбор (из 20)", 20),
-    ("DISCOUNT_50", "🏷 Скидка 50% на схемы для вышивания", 80),
+    ("SCHEME_10", "🎁 Схема на выбор (из 10)", 10),
+    ("DISCOUNT_50", "🏷 Скидка 50% на схемы для вышивания", 70),
 ]
 
 
@@ -174,7 +189,7 @@ def _sqlite_add_column_if_missing(conn, table: str, column: str, coltype_sql: st
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 
-    # soft migration for old sqlite DB
+    # Soft migration for old sqlite DB
     if DATABASE_URL.startswith("sqlite"):
         with engine.begin() as conn:
             try:
@@ -192,12 +207,33 @@ def init_db() -> None:
         if st is None:
             total_prizes = sum(x[2] for x in PRIZES)
             db.add(RaffleState(id=1, remaining_attempts=TOTAL_ATTEMPTS, remaining_prizes=total_prizes))
+            db.commit()
+
+        # Ensure inventory rows exist; if already exist — cap to new counts
+        if RESET_PRIZES:
+            # full reset (dangerous)
+            db.execute(text("DELETE FROM prize_inventory"))
+            db.commit()
 
         for code, title, count in PRIZES:
-            if db.get(PrizeInventory, code) is None:
+            row = db.get(PrizeInventory, code)
+            if row is None:
                 db.add(PrizeInventory(code=code, title=title, remaining=count))
+            else:
+                row.title = title
+                # If lowering prize counts, cap remaining
+                if row.remaining > count:
+                    row.remaining = count
 
         db.commit()
+
+        # Recompute remaining_prizes from inventory (safer after edits)
+        inv = db.scalars(select(PrizeInventory)).all()
+        total_remaining = sum(x.remaining for x in inv)
+        st = db.get(RaffleState, 1)
+        if st:
+            st.remaining_prizes = total_remaining
+            db.commit()
 
 
 # ==========================
@@ -259,7 +295,7 @@ def comment_has_codeword(text_val: str) -> bool:
 
 
 # ==========================
-# Prize picking + winner record
+# Prize / Winner record
 # ==========================
 def _pick_any_available_prize(db, rng: random.Random) -> Optional[PrizeInventory]:
     prizes = db.scalars(select(PrizeInventory).where(PrizeInventory.remaining > 0)).all()
@@ -335,7 +371,7 @@ def draw_one_attempt(
 
 
 # ==========================
-# Admin
+# Admin helpers
 # ==========================
 def is_admin(tg_user_id: int) -> bool:
     return tg_user_id in ADMIN_TG_IDS
@@ -364,9 +400,49 @@ def build_stats_text_plain() -> str:
             lines.append(f"• {pr.title} — {pr.remaining}")
         lines.append("")
         lines.append(f"🎲 WIN_PROB = {WIN_PROB} (примерно 1 из {pretty_ratio(WIN_PROB)})")
+        lines.append(f"🗄 DATABASE_URL = {sanitize_db_url(DATABASE_URL)}")
         return "\n".join(lines)
 
 
+def build_db_info_text() -> str:
+    from urllib.parse import urlparse
+    u = DATABASE_URL or ""
+    safe = sanitize_db_url(u)
+    try:
+        p = urlparse(u.replace("postgresql+psycopg", "postgresql"))
+        host = p.hostname or ""
+        port = p.port or ""
+        dbname = (p.path or "").lstrip("/")
+        scheme = p.scheme
+    except Exception:
+        host = port = dbname = scheme = "?"
+    lines = [
+        "🧩 DB INFO",
+        f"• URL (safe): {safe}",
+        f"• scheme: {scheme}",
+        f"• host: {host}",
+        f"• port: {port}",
+        f"• db: {dbname}",
+    ]
+    return "\n".join(lines)
+
+
+def build_winners_csv_bytes() -> Tuple[bytes, int]:
+    with SessionLocal() as db:
+        rows: List[Winner] = db.scalars(select(Winner).order_by(Winner.id.asc())).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "timestamp", "vk_user_id", "prize_code", "prize_title", "source", "post_id", "comment_id"])
+    for w in rows:
+        writer.writerow([w.id, w.ts, w.vk_user_id, w.prize_code, w.prize_title, w.source, w.post_id, w.comment_id])
+
+    return output.getvalue().encode("utf-8"), len(rows)
+
+
+# ==========================
+# Telegram commands
+# ==========================
 async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None or update.message is None:
         return
@@ -374,6 +450,15 @@ async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Нет доступа.")
         return
     await update.message.reply_text(build_stats_text_plain())
+
+
+async def admin_db_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or update.message is None:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    await update.message.reply_text(build_db_info_text())
 
 
 async def admin_winners_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,23 +496,118 @@ async def admin_export_csv_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("⛔ Нет доступа.")
         return
 
-    with SessionLocal() as db:
-        rows: List[Winner] = db.scalars(select(Winner).order_by(Winner.id.asc())).all()
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["id", "timestamp", "vk_user_id", "prize_code", "prize_title", "source", "post_id", "comment_id"])
-    for w in rows:
-        writer.writerow([w.id, w.ts, w.vk_user_id, w.prize_code, w.prize_title, w.source, w.post_id, w.comment_id])
-
-    data = io.BytesIO(output.getvalue().encode("utf-8"))
-    data.name = "winners_export.csv"
-    data.seek(0)
+    data_bytes, count_rows = build_winners_csv_bytes()
+    bio = io.BytesIO(data_bytes)
+    bio.name = "winners_export.csv"
+    bio.seek(0)
 
     await update.message.reply_document(
-        document=InputFile(data, filename="winners_export.csv"),
-        caption=f"Экспорт победителей: {len(rows)} строк"
+        document=InputFile(bio, filename="winners_export.csv"),
+        caption=f"Экспорт победителей: {count_rows} строк"
     )
+
+
+# ==========================
+# Telegram — bonus only
+# ==========================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or update.message is None:
+        return
+
+    args = context.args or []
+    if not args or not VK_ID_RE.match(args[0]):
+        await update.message.reply_text(
+            "Команда: /start <ваш_vk_id>\n"
+            "Пример: /start 123456\n\n"
+            "После активации бонуса крутите в ВК: пишите комментарий с кодовым словом."
+        )
+        return
+
+    vk_id = int(args[0])
+    tg_id = update.effective_user.id
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=TG_CHANNEL, user_id=tg_id)
+        status = getattr(member, "status", None)
+        tg_ok = status in ("member", "administrator", "creator")
+    except Exception as e:
+        print("TG get_chat_member error:", repr(e))
+        tg_ok = False
+
+    with SessionLocal() as db:
+        p = db.get(Participant, vk_id)
+        if p is None:
+            await update.message.reply_text(
+                "Я не вижу вашу заявку в ВК.\n"
+                "Сначала напишите кодовое слово в комментарии под постом ВК."
+            )
+            return
+
+        if p.result_code is not None:
+            await update.message.reply_text(p.result_text or "Вы уже получили приз.")
+            return
+
+        p.tg_user_id = tg_id
+        p.tg_member_ok = tg_ok
+        db.commit()
+
+        if not tg_ok:
+            await update.message.reply_text(
+                "Чтобы получить бонусные попытки, подпишитесь на Telegram-канал ✅\n"
+                f"{tg_channel_link()}\n\n"
+                "После подписки повторите:\n"
+                f"/start {vk_id}"
+            )
+            return
+
+        if p.tg_bonus_granted:
+            await update.message.reply_text(
+                f"Бонус уже активирован ранее ✅\n"
+                f"Осталось бонусных попыток: {p.bonus_remaining}\n\n"
+                "Используйте попытки в ВК: пишите комментарий с кодовым словом под постом."
+            )
+            return
+
+        p.tg_bonus_granted = True
+        p.bonus_remaining = TG_BONUS_ATTEMPTS
+        db.commit()
+
+    await update.message.reply_text(
+        "✅ Бонус активирован!\n\n"
+        f"Вам добавлено +{TG_BONUS_ATTEMPTS} бонусные попытки.\n"
+        "Используются по одной — только в ВК.\n\n"
+        "👉 Вернитесь в ВК и пишите комментарий с кодовым словом под постом, чтобы крутить."
+    )
+
+
+# ==========================
+# Auto-backup task (send CSV daily to admins)
+# ==========================
+async def auto_backup_loop(bot: Bot):
+    if not ADMIN_TG_IDS:
+        print("Auto-backup: ADMIN_TG_IDS empty -> disabled")
+        return
+
+    print(f"Auto-backup: enabled every {AUTO_BACKUP_INTERVAL_SECONDS}s for admins: {sorted(list(ADMIN_TG_IDS))}")
+    while True:
+        try:
+            data_bytes, count_rows = build_winners_csv_bytes()
+            bio = io.BytesIO(data_bytes)
+            bio.name = "winners_backup.csv"
+            bio.seek(0)
+
+            caption = f"🗂 Авто-бэкап победителей (CSV)\nСтрок: {count_rows}\nUTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now_ts()))}"
+
+            for admin_id in list(ADMIN_TG_IDS):
+                try:
+                    bio.seek(0)
+                    await bot.send_document(chat_id=admin_id, document=InputFile(bio, filename="winners_backup.csv"), caption=caption)
+                except Exception as e:
+                    print("Auto-backup send error to", admin_id, ":", repr(e))
+        except Exception as e:
+            print("Auto-backup loop error:", repr(e))
+
+        await asyncio.sleep(max(60, AUTO_BACKUP_INTERVAL_SECONDS))
 
 
 # ==========================
@@ -435,11 +615,12 @@ async def admin_export_csv_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 # ==========================
 app = FastAPI()
 tg_app: Optional[Application] = None
+_backup_task: Optional[asyncio.Task] = None
 
 
 @app.on_event("startup")
 async def on_startup():
-    global tg_app
+    global tg_app, _backup_task
     init_db()
 
     if TG_BOT_TOKEN:
@@ -448,6 +629,7 @@ async def on_startup():
         tg_app.add_handler(CommandHandler("admin_stats", admin_stats_cmd))
         tg_app.add_handler(CommandHandler("admin_winners", admin_winners_cmd))
         tg_app.add_handler(CommandHandler("admin_export_csv", admin_export_csv_cmd))
+        tg_app.add_handler(CommandHandler("admin_db_info", admin_db_info_cmd))
 
         use_webhook = (RUN_MODE == "webhook") or bool(RENDER_EXTERNAL_URL)
         if use_webhook:
@@ -456,39 +638,30 @@ async def on_startup():
 
             base = RENDER_EXTERNAL_URL.rstrip("/")
             if not base:
-                print("WARN: RENDER_EXTERNAL_URL is empty; webhook not set.")
-                return
+                print("WARN: RENDER_EXTERNAL_URL empty; webhook not set.")
+            else:
+                webhook_url = f"{base}/tg/webhook"
+                try:
+                    bot = Bot(token=TG_BOT_TOKEN)
+                    # IMPORTANT: drop pending updates to avoid conflicts after redeploy
+                    await bot.delete_webhook(drop_pending_updates=True)
+                    await bot.set_webhook(webhook_url)
+                    print("Telegram webhook set:", webhook_url)
+                except Exception as e:
+                    print("Telegram webhook setup error:", repr(e))
 
-            webhook_url = f"{base}/tg/webhook"
+            # start daily auto-backup loop (works in webhook mode)
             try:
                 bot = Bot(token=TG_BOT_TOKEN)
-                # IMPORTANT: drop pending updates to avoid conflicts after redeploy
-                await bot.delete_webhook(drop_pending_updates=True)
-                await bot.set_webhook(webhook_url)
-                print("Telegram webhook set:", webhook_url)
+                if _backup_task is None:
+                    _backup_task = asyncio.create_task(auto_backup_loop(bot))
             except Exception as e:
-                print("Telegram webhook setup error:", repr(e))
+                print("Auto-backup start error:", repr(e))
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
-@app.get("/debug/env")
-def debug_env():
-    return JSONResponse({
-        "VK_GROUP_ID": VK_GROUP_ID,
-        "VK_POST_ID": VK_POST_ID,
-        "CODEWORD": CODEWORD,
-        "WIN_PROB": WIN_PROB,
-        "DAILY_COOLDOWN_SECONDS": DAILY_COOLDOWN_SECONDS,
-        "TG_CHANNEL": TG_CHANNEL,
-        "TG_BOT_LINK": TG_BOT_LINK,
-        "RUN_MODE": RUN_MODE,
-        "RENDER_EXTERNAL_URL": RENDER_EXTERNAL_URL,
-        "ADMIN_TG_IDS_SET": sorted(list(ADMIN_TG_IDS))[:10],
-    })
 
 
 @app.post("/vk/callback")
@@ -600,79 +773,6 @@ async def vk_callback(req: Request):
     return PlainTextResponse("ok", status_code=200)
 
 
-# ==========================
-# Telegram — bonus only
-# ==========================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user is None or update.message is None:
-        return
-
-    args = context.args or []
-    if not args or not VK_ID_RE.match(args[0]):
-        await update.message.reply_text(
-            "Команда: /start <ваш_vk_id>\n"
-            "Пример: /start 123456\n\n"
-            "После активации бонуса крутите в ВК: пишите комментарий с кодовым словом."
-        )
-        return
-
-    vk_id = int(args[0])
-    tg_id = update.effective_user.id
-
-    try:
-        member = await context.bot.get_chat_member(chat_id=TG_CHANNEL, user_id=tg_id)
-        status = getattr(member, "status", None)
-        tg_ok = status in ("member", "administrator", "creator")
-    except Exception as e:
-        print("TG get_chat_member error:", repr(e))
-        tg_ok = False
-
-    with SessionLocal() as db:
-        p = db.get(Participant, vk_id)
-        if p is None:
-            await update.message.reply_text(
-                "Я не вижу вашу заявку в ВК.\n"
-                "Сначала напишите кодовое слово в комментарии под постом ВК."
-            )
-            return
-
-        if p.result_code is not None:
-            await update.message.reply_text(p.result_text or "Вы уже получили приз.")
-            return
-
-        p.tg_user_id = tg_id
-        p.tg_member_ok = tg_ok
-        db.commit()
-
-        if not tg_ok:
-            await update.message.reply_text(
-                "Чтобы получить бонусные попытки, подпишитесь на Telegram-канал ✅\n"
-                f"{tg_channel_link()}\n\n"
-                "После подписки повторите:\n"
-                f"/start {vk_id}"
-            )
-            return
-
-        if p.tg_bonus_granted:
-            await update.message.reply_text(
-                f"Бонус уже активирован ранее ✅\n"
-                f"Осталось бонусных попыток: {p.bonus_remaining}\n\n"
-                "Используйте попытки в ВК: пишите комментарий с кодовым словом под постом."
-            )
-            return
-
-        p.tg_bonus_granted = True
-        p.bonus_remaining = TG_BONUS_ATTEMPTS
-        db.commit()
-
-    await update.message.reply_text(
-        "✅ Бонус активирован!\n\n"
-        f"Вам добавлено +{TG_BONUS_ATTEMPTS} бонусные попытки.\n"
-        "Используются по одной — только в ВК.\n\n"
-        "👉 Вернитесь в ВК и пишите комментарий с кодовым словом под постом, чтобы крутить."
-    )
-
-
 @app.post("/tg/webhook")
 async def tg_webhook(req: Request):
     if not TG_BOT_TOKEN or tg_app is None:
@@ -703,10 +803,16 @@ def run_telegram_polling():
         application.add_handler(CommandHandler("admin_stats", admin_stats_cmd))
         application.add_handler(CommandHandler("admin_winners", admin_winners_cmd))
         application.add_handler(CommandHandler("admin_export_csv", admin_export_csv_cmd))
+        application.add_handler(CommandHandler("admin_db_info", admin_db_info_cmd))
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
         print("Telegram polling started.")
+
+        # auto-backup in polling mode too
+        bot = Bot(token=TG_BOT_TOKEN)
+        asyncio.create_task(auto_backup_loop(bot))
+
         while True:
             await asyncio.sleep(3600)
 
@@ -717,13 +823,15 @@ def run_telegram_polling():
 # Entrypoint
 # ==========================
 if __name__ == "__main__":
-    print("Starting 7slonikov raffle bot...")
+    print("Starting raffle bot...")
     print("VK_GROUP_ID =", VK_GROUP_ID, "VK_POST_ID =", VK_POST_ID, "CODEWORD =", CODEWORD)
     print("TOTAL_ATTEMPTS =", TOTAL_ATTEMPTS, "WIN_PROB =", WIN_PROB)
     print("DAILY_COOLDOWN_SECONDS =", DAILY_COOLDOWN_SECONDS, "TG_BONUS_ATTEMPTS =", TG_BONUS_ATTEMPTS)
     print("TG_CHANNEL =", TG_CHANNEL, "TG_BOT_LINK =", TG_BOT_LINK)
     print("RUN_MODE =", RUN_MODE, "RENDER_EXTERNAL_URL =", RENDER_EXTERNAL_URL)
     print("ADMIN_TG_IDS =", sorted(list(ADMIN_TG_IDS)) if ADMIN_TG_IDS else "<EMPTY>")
+    print("DATABASE_URL =", sanitize_db_url(DATABASE_URL))
+    print("PRIZES =", PRIZES)
 
     use_webhook = (RUN_MODE == "webhook") or bool(RENDER_EXTERNAL_URL)
     if not use_webhook:
@@ -731,8 +839,6 @@ if __name__ == "__main__":
         t.start()
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
-
 
 
 
