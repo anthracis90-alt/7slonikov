@@ -3,3 +3,5 @@ uvicorn
 requests
 sqlalchemy
 python-telegram-bot
+psycopg[binary]
+SQLAlchemy>=2.0
